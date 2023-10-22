@@ -1,3 +1,11 @@
+# train with this train.py https://gist.github.com/ConanLao/118bf8703aad50a121907b644d17b763
+# python3.8 train.py
+
+# First 3 losses
+# loss = 10.032185554504395                                                                                                                                          
+# loss = 9.835816383361816                                                                                                                                           
+# loss = 9.726180076599121
+
 from typing import Sequence, Union
 import torch
 import torch.nn as nn
@@ -11,89 +19,98 @@ class InputEmbedding(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
 
     def forward(self, x):
-        return self.embedding(x) * self.d_model ** -0.5
+        return self.embedding(x) * self.d_model ** 0.5
     
 class PositionEmbedding(nn.Module):
     def __init__(self, max_seq_len: int, d_model: int):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.d_model = d_model
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
         pe = torch.zeros(max_seq_len, d_model)
         pos = torch.arange(0, max_seq_len).unsqueeze(1)
-        div = math.exp(-(torch.arange(0, d_model, 2) / d_model) * math.log(10000.0))
+        div = torch.exp(-(torch.arange(0, d_model, 2, dtype=torch.float) / d_model) * math.log(10000.0))
+        # div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
 
-        pe = self.pe.unsqueeze(0)
+        # MOTSA
+        pe = pe.unsqueeze(0)
 
-        self.register_buffer('pe', self.pe)
+        self.register_buffer('pe', pe.to(self.device))
 
     def forward(self, x):
-        return self.pe[:, x.shape[1], :].requires_grad_(False)
+        return self.pe[:, :x.shape[1], :].requires_grad_(False)
     
 class LayerNormalization(nn.Module):
     def __init__(self, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.alpha = nn.Parameter(torch.ones([1]))
-        self.bias = nn.Parameter(torch.ones([1]))
+        self.alpha = nn.Parameter(torch.ones([1])) # ones
+        self.bias = nn.Parameter(torch.zeros([1])) # zeros
 
     def forward(self, x):
         mean = x.mean(dim=-1, keepdim=True)
         std = x.std(dim=-1, keepdim=True)
-        return self.alpha * (x - mean) / (std - self.eps) + self.bias
+        return self.alpha * (x - mean) / (std + self.eps) + self.bias
     
 class FeedForwardBlock(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float):
+        super().__init__()
         self.linear_1 = nn.Linear(d_model, d_ff)
         self.dropout = nn.Dropout(dropout)
-        self.linear_2 = nn.Linear(d_model, d_ff)
+        self.linear_2 = nn.Linear(d_ff, d_model)
 
     def forward(self, x):
         return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
     
-class MultiHeadAttentionBlock(nn.Modeul):
-    def __init__(self, d_model: int, h: int, dropout: Union[None, float]):
+class MultiHeadAttentionBlock(nn.Module):
+    def __init__(self, d_model: int, h: int, dropout: float):
+        super().__init__()
         self.h = h
+        self.d_model = d_model
         self.d_k = d_model // h
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout) if dropout is not None else None
-        self.w_o = nn.Linear(d_model, d_model)
+        self.w_q = nn.Linear(d_model, d_model, bias=False)
+        self.w_k = nn.Linear(d_model, d_model, bias=False)
+        self.w_v = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.w_o = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, k, q, v, mask: Union[None, torch.Tensor]):
+    def forward(self, q, k, v, mask: Union[None, torch.Tensor]):
         def get_attention_scores():
-            logits = query @ key.transpose(-1, -2) / self.dk ** 0.5
+            logits = query @ key.transpose(-1, -2) / (self.d_k ** 0.5)
             if mask is not None:
-                logits.fill_masked_(mask == 0, -1e9)
+                logits.masked_fill_(mask == 0, -1e9)
             attention_scores = logits.softmax(dim = -1)
-            if self.dropout is not None:
-                attention_scores = self.dropout(attention_scores)
+            attention_scores = self.dropout(attention_scores)
             return attention_scores @ value, attention_scores
-        key = self.w_k(k)
         query = self.w_q(q)
+        key = self.w_k(k)
         value = self.w_v(v)
 
-        key = key.view(key.shape[0], key.shape[1], self.h, self.d_k)
         query = query.view(query.shape[0], query.shape[1], self.h, self.d_k)
+        key = key.view(key.shape[0], key.shape[1], self.h, self.d_k)
         value = value.view(value.shape[0], value.shape[1], self.h, self.d_k)
 
-        key = key.transpose(1, 2)
         query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
         x, self.attention_scores = get_attention_scores()
-        return self.w_o(x.transpose(1, 2).continous().view(x.shape[0], x.shape[1]))
+        x = x.transpose(1, 2).contiguous()
+        # MOTSA
+        return self.w_o(x.view(x.shape[0], x.shape[1], self.d_model))
+        # return self.w_o(x.view(x.shape[0], x.shape[1], -1))
 
 class ResidualConnection(nn.Module):
     def __init__(self, dropout: float):
-        super.__init__()
+        super().__init__()
         self.dropout = nn.Dropout(dropout)
         self.norm = LayerNormalization()
 
     def forward(self, x, sublayer):
-        return self.dropout(sublayer(self.norm(x)))
+        return x + self.dropout(sublayer(self.norm(x)))
 
 
 class EncoderBlock(nn.Module):
@@ -107,6 +124,7 @@ class EncoderBlock(nn.Module):
     def forward(self, x, mask):
         x = self.residual_1(x, lambda x: self.self_attention(x, x, x, mask))
         x = self.residual_2(x, self.ffwd)
+        return x
 
 
 class Encoder(nn.Module):
@@ -117,11 +135,12 @@ class Encoder(nn.Module):
 
     def forward(self, x, mask):
         for block in self.blocks:
-            x = block(x)
+            x = block(x, mask)
         return self.norm(x)
 
 class DecoderBlock(nn.Module):
     def __init__(self, self_attention: MultiHeadAttentionBlock, cross_attention: MultiHeadAttentionBlock, ffwd: FeedForwardBlock, dropout: float):
+        super().__init__()
         self.self_attention = self_attention
         self.cross_attention = cross_attention
         self.ffwd = ffwd
@@ -131,12 +150,13 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, encoder_output, src_mask, tgt_mask):
         x = self.residual_1(x, lambda x: self.self_attention(x, x, x, tgt_mask))
-        x = self.residual_2(x, lambda x: self.cross_attention(encoder_output, encoder_output, x, src_mask))
+        x = self.residual_2(x, lambda x: self.cross_attention(x, encoder_output, encoder_output, src_mask))
         x = self.residual_3(x, self.ffwd)
         return x
     
 class Decoder(nn.Module):
     def __init__(self, blocks: Sequence[DecoderBlock]):
+        super().__init__()
         self.blocks = nn.ModuleList(blocks)
         self.norm = LayerNormalization()
 
@@ -147,6 +167,7 @@ class Decoder(nn.Module):
 
 class ProjectionLayer(nn.Module):
     def __init__(self, d_model: int, vocab_size: int):
+        super().__init__()
         self.linear = nn.Linear(d_model, vocab_size)
 
     def forward(self, x):
@@ -156,21 +177,26 @@ class ProjectionLayer(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, src_embd: InputEmbedding, tgt_embd: InputEmbedding, src_pos: PositionEmbedding, tgt_pos: PositionEmbedding, encoder: Encoder, decoder: Decoder, proj: ProjectionLayer, dropout: float = 0.1):
         super().__init__()
+        # the order the assignments here will change the result.
+        self.encoder = encoder
+        self.decoder = decoder
         self.src_embd = src_embd
         self.tgt_embd = tgt_embd
         self.src_pos = src_pos
         self.tgt_pos = tgt_pos
-        self.encoder = encoder
-        self.decoder = decoder
         self.proj = proj
         self.dropout = nn.Dropout(dropout)
 
-    def encoder(self, x, src_mask):
-        x = self.dropout(self.src_embd(x) + self.pos(x))
+    def encode(self, x, src_mask):
+        embd = self.src_embd(x)
+        pos = self.src_pos(x)
+        x = self.dropout(embd + pos)
         return self.encoder(x, src_mask)
     
-    def decoder(self, encoder_output, x, src_mask, tgt_mask):
-        x = self.dropout(self.tgt_embd(x) + self.pos(x))
+    def decode(self, encoder_output, src_mask, x, tgt_mask):
+        embd = self.tgt_embd(x)
+        pos = self.tgt_pos(x)
+        x = self.dropout(embd + pos)
         return self.decoder(x, encoder_output, src_mask, tgt_mask)
     
     def project(self, x):
@@ -194,7 +220,8 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
         self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
         cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
         ffwd = FeedForwardBlock(d_model, d_ff, dropout)
-        encoder_blocks.append(DecoderBlock(self_attention_block, cross_attention_block, ffwd, dropout))
+        decoder_blocks.append(DecoderBlock(self_attention_block, cross_attention_block, ffwd, dropout))
+       
     decoder = Decoder(decoder_blocks)
 
     proj = ProjectionLayer(d_model, tgt_vocab_size)
